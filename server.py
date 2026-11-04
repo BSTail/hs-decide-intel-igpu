@@ -142,13 +142,24 @@ _infer_lock = asyncio.Lock()
 # context resident. Only active on XPU; a no-op on CPU. Disabled by HS_DECIDE_WARM_SECONDS=0.
 _WARM_INTERVAL = float(os.environ.get("HS_DECIDE_WARM_SECONDS", "60"))
 
+# One persistent probe tensor, allocated once. Building a fresh tensor each tick
+# can accumulate per-pass allocations (and host-side shadowing) that make RSS grow
+# unboundedly, which is what we saw (2.9GB -> 6.5GB). Reuse this single buffer.
+_warm_ids = tokenizer.encode("warm", add_special_tokens=False)[:8]
+_WARM_PROBE = _to_device(torch.tensor([_warm_ids], dtype=torch.long))  # [L], re-used every pass
+
 
 def _warm_pass() -> None:
-    """One throwaway forward pass; touches the model so XPU keeps the context hot."""
+    """One throwaway forward pass; touches the model so XPU keeps the context hot.
+
+    Reuses the persistent _WARM_PROBE buffer and releases the result + the allocator's
+    cached-unused blocks so a periodic no-op does not grow device/host memory.
+    """
     with torch.no_grad():
-        ids = tokenizer.encode("warm", add_special_tokens=False)[:8]
-        probe = _to_device(torch.tensor([ids], dtype=torch.long))  # [L] — same shape as decode()
-        _base(input_ids=probe, use_cache=False)
+        out = _base(input_ids=_WARM_PROBE, use_cache=False)
+        del out
+    if DEVICE == "xpu" and hasattr(torch.xpu, "empty_cache"):
+        torch.xpu.empty_cache()
 
 
 async def _warm_loop() -> None:
@@ -169,7 +180,12 @@ async def _warm_loop() -> None:
             print(f"[hs-decide] warm pass FAILED ({exc!r})", flush=True)
         else:
             ms = (time.monotonic() - t0) * 1000
-            print(f"[hs-decide] warm pass OK ({ms:.0f}ms)", flush=True)
+            alloc_mb = torch.xpu.memory_allocated() // (1024 * 1024)
+            resv_mb = torch.xpu.memory_reserved() // (1024 * 1024)
+            print(
+                f"[hs-decide] warm pass OK ({ms:.0f}ms; alloc={alloc_mb}MB resv={resv_mb}MB)",
+                flush=True,
+            )
 
 
 def decode(request: schema.SystemOneRequest) -> dict:
