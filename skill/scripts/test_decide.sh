@@ -127,7 +127,12 @@ mk "mock 500 inference_error" 2 "500" "mock500"
 mk "mock malformed response body" 1 "not valid JSON" "mockpartial"
 mk "mock answers null" 1 "answers" "mockanswersnull"
 mk "mock choice missing fields" 1 "missing" "mockchoice_missing"
-# 5. real timeout (mock hangs longer than HS_DECIDE_TIMEOUT) -> exit 1
+# 5. connection refused -> exit 1
+out="$(printf '%s' '{"state":"s","questions":{"q":{"type":"noul","criteria":{"true":"x","false":"y"}}}}' | HS_DECIDE_BASE_URL=http://127.0.0.1:59999 "$PY" scripts/decide.py 2>&1)"
+got=$?
+if [ "$got" = 1 ]; then printf '  PASS  conn refused -> exit 1\n'; pass=$((pass+1)); else printf '  FAIL  conn refused -> exit 1 (exit %s)\n    %s\n' "$got" "$out"; fail=$((fail+1)); fi
+
+# 5b. real timeout (mock hangs longer than HS_DECIDE_TIMEOUT) -> exit 1
 mk "real timeout" 1 "connection failed" "mockhang"
 
 # 8. determinism: two identical live calls -> byte-identical output

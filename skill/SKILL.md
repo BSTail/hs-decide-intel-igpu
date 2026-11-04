@@ -272,5 +272,7 @@ mock server plus the live endpoint:
    two distributions are printed for comparison — **qualitative**, since a small
    model is not guaranteed to shift on every input).
 
-Run with the server up for fixtures 1-3, 8, 9. The fixtures are the source of
-truth for the contract; if a test and this document disagree, trust the test.
+Run with the server up for fixtures 1-4, 8, 9 (fixture 4 is the live auth test).
+Fixture 5's connection-refused check and fixtures 6-7 use self-contained mocks.
+The fixtures are the source of truth for the contract; if a test and this
+document disagree, trust the test.
