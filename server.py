@@ -122,11 +122,44 @@ def _authorized(raw_request: Request) -> bool:
 
 app = FastAPI(title="hs-decide-1-flash")
 
+
+@app.on_event("startup")
+async def _startup_warm_loop() -> None:
+    if _WARM_INTERVAL > 0:
+        asyncio.create_task(_warm_loop())
+
 # Single-flight lock: the iGPU (shared-memory Arc 140V) runs out of device memory
 # if two forward passes run concurrently (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, code 39).
 # Serialize all inference so only one XPU pass runs at a time; callers queue briefly
 # instead of OOM-ing. Safe at ~140ms/pass even under Hindsight's burst retries.
 _infer_lock = asyncio.Lock()
+
+# Keep-warm: the idle iGPU (shared-memory Arc 140V) context ages out and swaps to disk,
+# so the first real decision after idle has to page the weights back into device memory
+# and can hit OUT_OF_DEVICE_MEMORY (code 39). A periodic no-op forward pass holds the
+# context resident. Only active on XPU; a no-op on CPU. Disabled by HS_DECIDE_WARM_SECONDS=0.
+_WARM_INTERVAL = float(os.environ.get("HS_DECIDE_WARM_SECONDS", "60"))
+
+
+def _warm_pass() -> None:
+    """One throwaway forward pass; touches the model so XPU keeps the context hot."""
+    with torch.no_grad():
+        probe = _to_device(torch.tensor([[tokenizer.encode("warm", add_special_tokens=False)[:8]]], dtype=torch.long))
+        _base(input_ids=probe, use_cache=False)
+
+
+async def _warm_loop() -> None:
+    import random
+
+    while True:
+        await asyncio.sleep(_WARM_INTERVAL + random.uniform(0, 5))
+        if DEVICE != "xpu":
+            continue
+        try:
+            async with _infer_lock:
+                await asyncio.get_running_loop().run_in_executor(None, _warm_pass)
+        except Exception as exc:  # never let a warm pass kill the service
+            print(f"[hs-decide] warm pass failed ({exc!r})", flush=True)
 
 
 def decode(request: schema.SystemOneRequest) -> dict:
@@ -154,8 +187,16 @@ def decode(request: schema.SystemOneRequest) -> dict:
 
 
 @app.get("/healthz")
+@app.get("/health")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/v1/models")
+async def models():
+    # OpenAI-style model list: Hindsight probes this alongside /health. Return the
+    # one model this server serves so the probe stops 404-ing.
+    return {"object": "list", "data": [{"id": "hs-decide-1-flash", "object": "model"}]}
 
 
 @app.post("/v1/systemone")

@@ -67,7 +67,15 @@ Two non-obvious bugs this avoids (they cost the most time):
 1. **Qwen3.5 keeps its final RMSNorm *inside* `lm_head`**, not in `model.norm`. Do **not** pre-apply a norm to a column-sliced head; project through `model.lm_head` and slice afterward.
 2. **BF16 OOM trap:** casting the *whole* `[L, 248320]` lm-head logits to float32 **on the device** per call exhausts the iGPU's shared-memory pool (`level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)`). Keep the head in bf16 and `.float()` only the narrow classifier slice.
 
-The server also uses a **single-flight asyncio lock** so concurrent requests serialize (the shared-memory iGPU must not run two passes at once), and optional bearer auth (`HS_DECIDE_API_KEY`) to satisfy Hindsight's client.
+The server also uses a **single-flight asyncio lock** so concurrent requests serialize (the shared-memory iGPU must not run two passes at once), optional bearer auth (`HS_DECIDE_API_KEY`) to satisfy Hindsight's client, and a **keep-warm loop** to stop the idle iGPU context from swapping out (see Gotchas).
+
+Endpoints the server exposes:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/systemone` | the decision call itself |
+| `GET` | `/health` (and `/healthz`) | liveness — Hindsight polls `/health` every ~30s |
+| `GET` | `/v1/models` | OpenAI-style model list — Hindsight probes this too |
 
 Run it:
 ```bash
@@ -104,10 +112,10 @@ In Hindsight, consolidation triage went from `decision_input_tokens=0` (decision
 ## Gotchas
 
 - **Don't containerize the XPU server on an Arch host.** Baking the host's Intel Level Zero driver + `libstdc++` into a `python:3.12-slim`/Debian container produces a glibc/libstdc++ ABI mismatch (the driver needs `GLIBCXX_3.4.35`; that container base has `3.4.33`) and the driver aborts in `command_stream_receiver`. Run it as a host **systemd user unit** instead — the iGPU shares system RAM, so there's no isolation win in Docker anyway.
+- **The idle iGPU context swaps out and OOMs on wake.** After idle, the Arc iGPU's context ages out and pages to swap (the host's shared-memory iGPU), so the first real decision after idle can hit `level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)`. The server ships a **keep-warm loop** that runs a no-op forward pass every `HS_DECIDE_WARM_SECONDS` (default `60`, ±0–5s jitter; set `0` to disable) to hold the context resident. If you see `error 39` under *genuine* concurrent load rather than idle-wake, that's the shared-memory bar, not the swap-out — the FP32-on-CPU path (`HS_DECIDE_FP32=1`) is the OOM-proof fallback at ~2.2s/decision.
+- **Hindsight polls `/health` and `/v1/models`**, not just the decision endpoint. Keep those routes (they return `200` and the model list) or the logs fill with 404s and Hindsight can't confirm the model is live.
+- **If you run this alongside Hindsight's own memory plugin**, be aware the plugin's per-turn write-back (`retain`) can silently stall for a session after that session's transcript is compacted/checkpointed into a shorter form — its `retainedTurns` high-water mark never resets. Tracked upstream as `vectorize-io/hindsight#6314`. Unrelated to this server, but worth knowing so a "memory stopped updating" symptom isn't blamed on the decision model.
 
-## License
-
-The tutorial text and `server.py` are provided as-is under the MIT License. `hs-decide-1-flash` itself is Apache-2.0 (see its Hugging Face model card).
 ## This model is a generic decision endpoint, not just a Hindsight thing
 
 `hs-decide-1-flash` speaks a **System One** contract (`choice` / `score` / `noul` behind `POST /v1/systemone`). The same server here answers arbitrary `state` + typed `questions` from *any* caller — n8n, scripts, opencode skills, guardrail plugins — not only Hindsight's memory engine. Send it a state and one or more typed questions, get back a probability per answer option.
