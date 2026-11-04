@@ -125,8 +125,10 @@ app = FastAPI(title="hs-decide-1-flash")
 
 @app.on_event("startup")
 async def _startup_warm_loop() -> None:
-    if _WARM_INTERVAL > 0:
-        asyncio.create_task(_warm_loop())
+    if _WARM_INTERVAL <= 0:
+        print("[hs-decide] keep-warm DISABLED (HS_DECIDE_WARM_SECONDS=0)", flush=True)
+        return
+    asyncio.create_task(_warm_loop())
 
 # Single-flight lock: the iGPU (shared-memory Arc 140V) runs out of device memory
 # if two forward passes run concurrently (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, code 39).
@@ -144,22 +146,30 @@ _WARM_INTERVAL = float(os.environ.get("HS_DECIDE_WARM_SECONDS", "60"))
 def _warm_pass() -> None:
     """One throwaway forward pass; touches the model so XPU keeps the context hot."""
     with torch.no_grad():
-        probe = _to_device(torch.tensor([[tokenizer.encode("warm", add_special_tokens=False)[:8]]], dtype=torch.long))
+        ids = tokenizer.encode("warm", add_special_tokens=False)[:8]
+        probe = _to_device(torch.tensor([ids], dtype=torch.long))  # [L] — same shape as decode()
         _base(input_ids=probe, use_cache=False)
 
 
 async def _warm_loop() -> None:
     import random
+    import time
 
+    print(f"[hs-decide] keep-warm enabled: interval={_WARM_INTERVAL}s (device={DEVICE})", flush=True)
     while True:
         await asyncio.sleep(_WARM_INTERVAL + random.uniform(0, 5))
         if DEVICE != "xpu":
+            print("[hs-decide] keep-warm skipped (device is not xpu)", flush=True)
             continue
+        t0 = time.monotonic()
         try:
             async with _infer_lock:
                 await asyncio.get_running_loop().run_in_executor(None, _warm_pass)
         except Exception as exc:  # never let a warm pass kill the service
-            print(f"[hs-decide] warm pass failed ({exc!r})", flush=True)
+            print(f"[hs-decide] warm pass FAILED ({exc!r})", flush=True)
+        else:
+            ms = (time.monotonic() - t0) * 1000
+            print(f"[hs-decide] warm pass OK ({ms:.0f}ms)", flush=True)
 
 
 def decode(request: schema.SystemOneRequest) -> dict:
