@@ -2,11 +2,11 @@
 name: agent-decision-maker
 description: >-
   Rank courses of action, score candidate tests or hypotheses, and flag
-  duplicates/irrelevance using a local calibrated decision model
+  duplicates/irrelevance using a local probability-ranked decision model
   (hs-decide-1-flash behind POST /v1/systemone). Use when the agent must CHOOSE
   among a fixed set of next-actions, RANK candidate steps or tests by likely value,
   or decide whether something is a duplicate / not-new-information — and wants a
-  deterministic, probability-based ranking instead of a vibe. The agent (LLM)
+  probability-based ranking instead of a vibe. The agent (LLM)
   proposes the candidates; this decision model ranks or chooses among them.
 ---
 
@@ -24,11 +24,16 @@ It does not generate options, and it does not do open-ended reasoning.
 The endpoint accepts JSON and returns JSON. One copy-paste curl:
 
 ```bash
+# defaults so the example runs even with nothing exported (override as needed)
+export HS_DECIDE_BASE_URL="${HS_DECIDE_BASE_URL:-http://127.0.0.1:8000}"
+export HS_DECIDE_API_KEY="${HS_DECIDE_API_KEY:-local-dev-key}"
+export HS_DECIDE_MODEL="${HS_DECIDE_MODEL:-hs-decide-1-flash}"
+
 curl -sS -m 20 -X POST "$HS_DECIDE_BASE_URL/v1/systemone" \
   -H "Authorization: Bearer $HS_DECIDE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "hs-decide-1-flash",
+    "model": "'"$HS_DECIDE_MODEL"'",
     "state": "short factual summary of the situation",
     "questions": {
       "next": { "type": "choice",
@@ -39,9 +44,10 @@ curl -sS -m 20 -X POST "$HS_DECIDE_BASE_URL/v1/systemone" \
 
 A self-contained helper that reads a JSON request on **stdin** and prints the
 validated response (or a clear error, with a proper exit code) is bundled at
-`scripts/decide.py`. It reads `HS_DECIDE_BASE_URL`, `HS_DECIDE_API_KEY`, and
-`HS_DECIDE_MODEL` from the environment — never hardcodes them — and handles
-connection failures, timeouts, non-200s, and malformed bodies:
+`scripts/decide.py`. It ships local defaults for `HS_DECIDE_BASE_URL`,
+`HS_DECIDE_API_KEY`, and `HS_DECIDE_MODEL` that the environment overrides, so the
+key never has to appear on the command line. It handles connection failures,
+timeouts, non-200s, and malformed/partial bodies, and validates the response:
 
 ```bash
 echo '{"state":"...","questions":{...}}' | python scripts/decide.py
@@ -111,8 +117,8 @@ Every answer object carries `type` plus the type-specific fields below.
 - `probabilities` — a distribution over the labels (sums to ~1).
 - `confidence` — the server's own confidence value for the winning choice. It is
   **not a calibrated probability-of-correctness**; treat it as a rough strength
-  signal only. (For `score` and `noul` it is `0.0` — the server does not populate
-  it there.)
+  signal only. (`score` returns `confidence: 0.0`; `noul` omits the field
+  entirely.)
 
 ### `score`
 
@@ -180,13 +186,19 @@ rather than silently falling back to a guessed ranking.**
 ## Calibration & determinism (qualified)
 
 These outputs are **probability-like scores over the specific options you supply**,
-not calibrated real-world probabilities. Determinism holds only when **all** of
-these are identical: model, server version, device/backend, dtype, decoding
-config, and request text. Reordering `criteria` keys/levels **can change a small
-model's judgment** even though each individual request is reproducible — if
-ordering matters, fix a canonical order and state it.
+not calibrated real-world probabilities. Reproducibility holds only when **all**
+of these are identical: model, server version, device/backend, dtype, decoding
+config, request text, *and* running server process — a restart reloads BF16
+weights and can shift the decimal outputs (see the worked-example note). Reordering
+`criteria` keys/levels **can also change a small model's judgment** even though
+each individual request is reproducible — if ordering matters, fix a canonical
+order and state it.
 
 ## Worked examples
+
+> The decimal outputs below were recorded against one running server and **can
+> drift across a server restart or model version** (small BF16 model). Read them
+> for shape — the winner and rough ranking — not as stable values.
 
 ### 1. Root-cause attribution (the model identifies the cause itself)
 
@@ -202,8 +214,8 @@ ordering matters, fix a canonical order and state it.
   } }
 ```
 
-Example response (actual server output): `choice = "plugin"`, `probabilities =
-{ plugin: 0.98, server: 0.01, gpu: 0.00, user: 0.00 }`. *This is the model's
+Example response (recorded, illustrative): `choice = "plugin"`, `probabilities ≈
+{ plugin: 0.85, server: 0.01, gpu: 0.07, user: 0.07 }`. *This is the model's
 answer, not an independent confirmation that "plugin" is correct.*
 
 ### 2. Pick the best next action (genuinely unknown outcome)
@@ -222,9 +234,10 @@ answer, not an independent confirmation that "plugin" is correct.*
   } }
 ```
 
-Example response (actual): `next → "poc" (0.50)`, `urgency → score 2.16` favoring
-the "now" bucket. The model weighed neutral, mutually-exclusive options and did
-**not** have the answer pre-stated in `state`.
+Example response (recorded, illustrative): `next → "wait" (0.47)` with `poc
+0.27`, `docs 0.22`, `insufficient 0.04`; `urgency → score 2.13` (between "soon"
+and "now"; the modal bucket was "now" at 0.25). The model weighed neutral,
+distinct options and did **not** have the answer pre-stated in `state`.
 
 ### 3. Is this a duplicate? (noul, its intended use)
 
@@ -242,19 +255,22 @@ the "now" bucket. The model weighed neutral, mutually-exclusive options and did
 
 ## Contract tests
 
-`scripts/decide.py` is self-contained; `scripts/test_decide.sh` (or the same
-requests by hand) exercises:
+`scripts/decide.py` is self-contained; `scripts/test_decide.sh` exercises, via a
+mock server plus the live endpoint:
 
 1. one successful request of each type (`choice`, `score`, `noul`);
-2. incorrect `noul` usage (an `noul` question framed as yes/no — expect a hedged,
-   unhelpful number, illustrating the warning above);
-3. invalid `criteria` (a `choice` with one option) and empty `questions` → `422`;
-4. auth failure (wrong key) → `403`;
-5. timeout / connection refused → clear error, non-zero exit;
-6. `500 inference_error` → the helper surfaces it and does not crash;
-7. repeated-request determinism (two identical calls return identical
-   probabilities) under the stated same-config conditions;
-8. criterion-order sensitivity (swap two labels; note the probabilities may shift).
+2. incorrect `noul` usage (framed as yes/no — expect a hedged, unhelpful number);
+3. invalid `criteria` (a `choice` with one option) and empty `questions` → `422`
+   (asserted on the actual status text, not just the exit code);
+4. auth failure (wrong key) → `403` (status text asserted);
+5. connection refused *and* a real timeout → clear error, non-zero exit;
+6. `500 inference_error` (mocked) → the helper surfaces it, exit 2;
+7. malformed/partial response bodies and incomplete answers (mocked: `answers`
+   null, a `choice` missing `choice`/`probabilities`) → exit 1;
+8. repeated-request determinism (two identical live calls are byte-identical);
+9. criterion-order sensitivity (the same criteria in two orders are both run; the
+   two distributions are printed for comparison — **qualitative**, since a small
+   model is not guaranteed to shift on every input).
 
-Run with the server up. The fixtures are the source of truth for the contract;
-if a test and this document disagree, trust the test.
+Run with the server up for fixtures 1-3, 8, 9. The fixtures are the source of
+truth for the contract; if a test and this document disagree, trust the test.
