@@ -108,3 +108,17 @@ In Hindsight, consolidation triage went from `decision_input_tokens=0` (decision
 ## License
 
 The tutorial text and `server.py` are provided as-is under the MIT License. `hs-decide-1-flash` itself is Apache-2.0 (see its Hugging Face model card).
+## This model is a generic decision endpoint, not just a Hindsight thing
+
+`hs-decide-1-flash` speaks a **System One** contract (`choice` / `score` / `noul` behind `POST /v1/systemone`). The same server here answers arbitrary `state` + typed `questions` from *any* caller — n8n, scripts, opencode skills, guardrail plugins — not only Hindsight's memory engine. Send it a state and one or more typed questions, get back a probability per answer option.
+
+## Related ecosystem
+
+- **TypeSafe "Jev"** — the System One origin (`docs.typesafe.ai`); hs-decide is drop-in compatible.
+- **Cloudflare Clef** & **OpenAI Decisions API** — hosted System One providers Hindsight also supports.
+- **ollaya** (`github.com/ollaya-dev/ollaya`) — self-hosted System One server ("Ollama for decision models").
+- **Hindsight decision-model docs** — the official (CUDA/vLLM) self-host instructions: `hindsight.vectorize.io/developer/decision-models`.
+
+## License
+
+The tutorial text and `server.py` are provided as-is under the MIT License. `hs-decide-1-flash` itself is Apache-2.0 (see its Hugging Face model card).
