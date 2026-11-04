@@ -6,36 +6,61 @@ description: >-
   (hs-decide-1-flash behind POST /v1/systemone). Use when the agent must CHOOSE
   among a fixed set of next-actions, RANK candidate steps or tests by likely value,
   or decide whether something is a duplicate / not-new-information — and wants a
-  deterministic probability distribution instead of a vibe. The agent (LLM)
+  deterministic, probability-based ranking instead of a vibe. The agent (LLM)
   proposes the candidates; this decision model ranks or chooses among them.
 ---
 
 # Agent Decision Maker
 
 Turn a "what should I do / which is best / is this new" moment into a
-**calibrated ranking** using a local System One decision model.
+**ranked distribution of probabilities** using a local System One decision model
+(`hs-decide-1-flash`, 0.8B, behind `POST /v1/systemone`).
 
-## When to use
+The LLM **proposes the candidates**; the decision model **ranks a closed set**.
+It does not generate options, and it does not do open-ended reasoning.
 
-- **Rank next-actions** — "which of these steps should I take next?" → `choice` (or `score` for levels of preference).
-- **Score candidate tests/hypotheses** — "how likely is each of these to pay off?" → `score`.
-- **Flag duplicates / irrelevance** — "have we already covered this? is this NOT new information?" → `noul`.
+## Quick start (executable)
 
-You (the LLM) supply the **state** (a short factual summary of the situation) and the
-**questions** (the fixed options to rank/choose among). The model returns a
-probability per option, deterministic and bit-stable across runs.
+The endpoint accepts JSON and returns JSON. One copy-paste curl:
 
-## Endpoint
-
+```bash
+curl -sS -m 20 -X POST "$HS_DECIDE_BASE_URL/v1/systemone" \
+  -H "Authorization: Bearer $HS_DECIDE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "hs-decide-1-flash",
+    "state": "short factual summary of the situation",
+    "questions": {
+      "next": { "type": "choice",
+                "criteria": { "do_a": "take action A", "do_b": "take action B" } }
+    }
+  }'
 ```
-POST http://127.0.0.1:8000/v1/systemone
-Authorization: Bearer local-dev-key
-Content-Type: application/json
+
+A self-contained helper that reads a JSON request on **stdin** and prints the
+validated response (or a clear error, with a proper exit code) is bundled at
+`scripts/decide.py`. It reads `HS_DECIDE_BASE_URL`, `HS_DECIDE_API_KEY`, and
+`HS_DECIDE_MODEL` from the environment — never hardcodes them — and handles
+connection failures, timeouts, non-200s, and malformed bodies:
+
+```bash
+echo '{"state":"...","questions":{...}}' | python scripts/decide.py
 ```
 
-(Portable: change the base URL to any System One provider — ollaya, TypeSafe Jev,
-OpenAI Decisions — with no other change. Keep `local-dev-key` matching the server's
-`HS_DECIDE_API_KEY`.)
+## Configuration (environment)
+
+| Variable | Default (local) | Meaning |
+|---|---|---|
+| `HS_DECIDE_BASE_URL` | `http://127.0.0.1:8000` | API base (no trailing slash) |
+| `HS_DECIDE_API_KEY` | `local-dev-key` | bearer token (must match the server's `HS_DECIDE_API_KEY`) |
+| `HS_DECIDE_MODEL` | `hs-decide-1-flash` | model id sent in the request |
+
+Portability: the request/response contract here is the **System One** shape. You
+can point `HS_DECIDE_BASE_URL` at any provider that implements this *same*
+endpoint and contract (ollaya, TypeSafe Jev, OpenAI Decisions). But
+authentication and model identifiers **may differ** — you must supply the
+provider's own base URL, key, and model id. "No other change" holds only when the
+remote implements the identical `/v1/systemone` contract.
 
 ## Request shape
 
@@ -44,56 +69,132 @@ OpenAI Decisions — with no other change. Keep `local-dev-key` matching the ser
   "model": "hs-decide-1-flash",
   "state": "short factual summary of the situation",
   "questions": {
-    "<question_id>": { "type": "choice|score|noul", "...": "..." }
+    "<id>": { "type": "choice|score|noul", "..." : "..." }
   }
 }
 ```
 
-### The three question types (get these right)
+`state` may be a string or a JSON object/list. Questions is a non-empty map; each
+value must carry a `type` and the matching fields below.
 
-| type | meaning | required fields |
+### The three question types
+
+| type | meaning | required field |
 |---|---|---|
-| `choice` | pick ONE of N named options | `criteria`: `{ "<label>": "<description>", ... }` (≥2) |
-| `score` | rate on an ordered scale (treats as low→high) | `criteria`: `["<level1>", "<level2>", ...]` (2–10 levels) |
-| `noul` | **is this NOT relevant / should we ignore / is there no new information?** | `criteria`: `{ "true": "<means not-relevant>", "false": "<means relevant>" }` |
+| `choice` | pick ONE of N named options | `criteria`: `{ "<label>": "<description>", ... }` (≥2 labels) |
+| `score` | rate on an ordered scale low→high | `criteria`: `["<level0>", "<level1>", ...]` (2–10 levels) |
+| `noul` | "is this NOT relevant / should we ignore / is there no new information?" | `criteria`: `{ "true": "<means not-relevant>", "false": "<means relevant>" }` |
 
-> ⚠️ **Do NOT use `noul` for yes/no correctness or "is X true?"** `noul` literally
-> encodes "no + null" — it answers *"should this be set aside / is there nothing
-> here?"*, not "is the answer correct?". For a yes/no *correctness* question, use a
-> 2-option `choice` instead. (Verified: a `choice` landed the right answer at 0.87
-> where the same question as `noul` hedged at ~0.13.)
+Optional on every question: `instructions` (a string telling the model what to
+judge).
 
-## Response shape
+> ⚠️ **Do NOT use `noul` for factual yes/no or "is X right?"** `noul` encodes
+> "no + null": it answers *"should this be set aside / is there nothing new
+> here?"*, not "is the answer correct?". For a yes/no *correctness* question, use
+> a 2-option `choice`. (Verified: a `choice` landed the right answer at 0.87 where
+> the same question written as `noul` hedged near 0.13.)
+
+## Response shapes (verified against the running server)
+
+Every answer object carries `type` plus the type-specific fields below.
+
+### `choice`
 
 ```json
-{
-  "model": "hs-decide-1-flash",
-  "answers": {
-    "<question_id>": {
-      "type": "choice",
-      "choice": "consolidate_now",
-      "confidence": 0.28,
-      "probabilities": { "consolidate_now": 0.474, "defer": 0.334, "disable": 0.192 }
-    }
-  },
-  "usage": { "input_tokens": 37, "output_tokens": 0 }
-}
+{ "type": "choice",
+  "choice": "c",
+  "confidence": 0.109,
+  "probabilities": { "a": 0.347, "b": 0.247, "c": 0.406 } }
 ```
 
-- `choice` → `choice` (winner) + `probabilities` (full distribution).
-- `score` → `score` (weighted value) + `probabilities` + `legend` (index→label).
-- `noul` → `noul` = P(not-relevant); `1 - noul` = P(relevant).
+- `choice` — the winning label.
+- `probabilities` — a distribution over the labels (sums to ~1).
+- `confidence` — the server's own confidence value for the winning choice. It is
+  **not a calibrated probability-of-correctness**; treat it as a rough strength
+  signal only. (For `score` and `noul` it is `0.0` — the server does not populate
+  it there.)
 
-## Worked examples (verified against this server)
+### `score`
 
-### 1. Rank a course of action
+```json
+{ "type": "score",
+  "score": 1.474,
+  "confidence": 0.0,
+  "legend": { "0": "low", "1": "mid", "2": "high", "3": "vhigh" },
+  "probabilities": { "0": 0.344, "1": 0.130, "2": 0.235, "3": 0.292 } }
+```
 
-Request:
+- `score` — the **expected level index** = Σ i·P(i), in `[0, levels-1]`. Low →
+  favor the first (lowest) level; high → favor the last (highest).
+- `legend` — maps each index `"0"`, `"1"`, … to its label.
+- `probabilities` — distribution over the integer levels; `probabilities["0"]` is
+  the mass of the *lowest* ("best" if you ordered low→high) bucket.
+
+### `noul`
+
+```json
+{ "type": "noul", "noul": 0.388 }
+```
+
+- `noul` — P(not-relevant / ignore). `1 - noul` = P(relevant). **No** `legend`,
+  `confidence`, or `probabilities` fields are returned for `noul`.
+
+### Common
+
+- Top-level response: `{ "model": ..., "answers": { "<id>": {...} }, "usage":
+  { "input_tokens": N, "output_tokens": 0 } }`.
+- Probabilities are returned un-rounded floats; round only for display.
+- Ties: the server picks a single winner (`choice`) even when two probabilities
+  are close — always read the full `probabilities` map, never just the winner.
+
+## Failure handling & troubleshooting
+
+`/health` (or `/healthz`) only confirms the process is **alive**; it does **not**
+confirm inference is ready, and a healthy health-check can still precede an
+inference failure. Treat a real `POST` result as the source of truth.
+
+| Condition | Symptom | What to do |
+|---|---|---|
+| service down | connection refused / timeout | retry once after a moment; if still down, stop and report — do not loop |
+| auth failure | HTTP `401` / `403` | check `HS_DECIDE_API_KEY` matches the server |
+| validation error | HTTP `422` with `loc`/`msg` | fix the question shape (`criteria` count, missing `type`, etc.) |
+| inference failure | HTTP `500` with `{"type":"inference_error"}` | the model hit a device/runtime error (e.g. `error 39/40 OUT_OF_DEVICE_MEMORY` / `OUT_OF_RESOURCES` on a shared iGPU). Retrying the *same* request may succeed after the device frees memory; do not hammer. If it persists, the local server may need a restart (`systemctl --user restart hs-decide.service`) |
+| malformed/partial body | response is not valid JSON, or missing `answers` | treat as a failed call; do not parse/guess |
+
+Rule: **a single retry is reasonable; after that, surface the failure to the user
+rather than silently falling back to a guessed ranking.**
+
+## When NOT to use (safety)
+
+- **Prefer direct evidence or an inexpensive decisive test** over model judgment
+  where one exists (run the command, read the log, check the fact).
+- **Do not autonomously act on a near-tie or a low-confidence / under-supported
+  choice** — if the top options are within a few points or `confidence` is tiny,
+  ask the user or gather more evidence.
+- **Never use this as the sole authority** for destructive, security-sensitive,
+  production, or other high-stakes actions. It can *inform* a human decision; it
+  does not *make* one.
+- Treat outputs as **probability-like ranking scores**, not as the probability
+  that a proposition is factually true.
+
+## Calibration & determinism (qualified)
+
+These outputs are **probability-like scores over the specific options you supply**,
+not calibrated real-world probabilities. Determinism holds only when **all** of
+these are identical: model, server version, device/backend, dtype, decoding
+config, and request text. Reordering `criteria` keys/levels **can change a small
+model's judgment** even though each individual request is reproducible — if
+ordering matters, fix a canonical order and state it.
+
+## Worked examples
+
+### 1. Root-cause attribution (the model identifies the cause itself)
+
 ```json
 { "model": "hs-decide-1-flash",
-  "state": "A memory plugin stopped writing after a transcript was compacted. The bug is a monotonic turn counter that never resets.",
+  "state": "A memory plugin stopped writing sessions after a long transcript was compacted. A monotonic turn counter never resets when the transcript shrinks.",
   "questions": {
-    "root_cause": { "type": "choice", "criteria": {
+    "owner": { "type": "choice", "criteria": {
       "plugin": "the plugin's counter logic",
       "server": "the database server",
       "gpu": "the iGPU decision server",
@@ -101,32 +202,59 @@ Request:
   } }
 ```
 
-Answer: `choice = "plugin"` with `probabilities = { plugin: 0.982, ... }`.
+Example response (actual server output): `choice = "plugin"`, `probabilities =
+{ plugin: 0.98, server: 0.01, gpu: 0.00, user: 0.00 }`. *This is the model's
+answer, not an independent confirmation that "plugin" is correct.*
 
-### 2. Score candidate fixes by confidence
+### 2. Pick the best next action (genuinely unknown outcome)
 
-Request:
 ```json
 { "model": "hs-decide-1-flash",
-  "state": "iGPU decision server hit error 39 after idle; cause was idle context swap-out; fix applied was a keep-warm no-op every minute.",
+  "state": "Three candidate next steps for an open feature request: wait for a maintainer reply, build a small proof-of-concept, or write documentation.",
   "questions": {
-    "fix_is_right": { "type": "choice", "criteria": {
-      "correct": "keep-warm addresses the idle-swap cause",
-      "wrong": "keep-warm does not address it",
-      "partial": "helps but not a full fix" } }
+    "next": { "type": "choice", "criteria": {
+      "wait": "wait for the maintainer reply",
+      "poc": "build a proof-of-concept now",
+      "docs": "write documentation",
+      "insufficient": "not enough information to choose" } },
+    "urgency": { "type": "score", "criteria": [
+      "no rush", "someday", "soon", "now", "blocking" ] }
   } }
 ```
 
-Answer: `choice = "correct"` at `0.871`.
+Example response (actual): `next → "poc" (0.50)`, `urgency → score 2.16` favoring
+the "now" bucket. The model weighed neutral, mutually-exclusive options and did
+**not** have the answer pre-stated in `state`.
 
-## Rules of thumb
+### 3. Is this a duplicate? (noul, its intended use)
 
-1. **Propose candidates with the LLM, rank with the decision model.** Never ask it to
-   invent options — give it a fixed, closed list.
-2. **Match the type to the question.** `choice` = pick one; `score` = ordered rating;
-   `noul` = relevance/dedupe only.
-3. **Keep `state` terse and factual** — it's a 0.8B classifier, not a planner.
-4. **Trust the distribution, not just the winner.** A near-tie (0.45 vs 0.40) means
-   "genuinely close," not "first one won."
-5. **Read the winner + probability as a decision aid**, present it back to the user
-   with your own reasoning, and err toward the ranked order when acting autonomously.
+```json
+{ "model": "hs-decide-1-flash",
+  "state": "A newly-proposed fix duplicates an already-merged change that removes the same race condition.",
+  "questions": {
+    "already_known": { "type": "noul", "criteria": {
+      "true": "this adds no new information — ignore it",
+      "false": "this is genuinely new — keep it" } }
+  } }
+```
+
+`noul` near `1.0` ⇒ treat as duplicate/equivalent; near `0.0` ⇒ new information.
+
+## Contract tests
+
+`scripts/decide.py` is self-contained; `scripts/test_decide.sh` (or the same
+requests by hand) exercises:
+
+1. one successful request of each type (`choice`, `score`, `noul`);
+2. incorrect `noul` usage (an `noul` question framed as yes/no — expect a hedged,
+   unhelpful number, illustrating the warning above);
+3. invalid `criteria` (a `choice` with one option) and empty `questions` → `422`;
+4. auth failure (wrong key) → `403`;
+5. timeout / connection refused → clear error, non-zero exit;
+6. `500 inference_error` → the helper surfaces it and does not crash;
+7. repeated-request determinism (two identical calls return identical
+   probabilities) under the stated same-config conditions;
+8. criterion-order sensitivity (swap two labels; note the probabilities may shift).
+
+Run with the server up. The fixtures are the source of truth for the contract;
+if a test and this document disagree, trust the test.
