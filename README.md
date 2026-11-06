@@ -121,6 +121,12 @@ Leave recall on its local reranker (do **not** set `HINDSIGHT_API_RECALL_DECISIO
 - 30 sustained concurrent calls: **0 errors, 94 ms avg, 262 ms max**.
 - Answers are **bit-identical** to the CPU path (no numerical drift).
 
+Post-narrow-head-fix (the ~470× smaller lm_head projection):
+
+- Sequential decisions: **~42–76 ms** each.
+- 12-way concurrent burst (hammering the single-flight lock): **0 errors**, ~413 ms total wall, per-request 42–406 ms (avg ~220 ms) — requests serialize cleanly instead of OOM-ing.
+- Resident memory flat at **~2.8 GB** throughout the burst; negligible host load.
+
 In Hindsight, consolidation triage went from `decision_input_tokens=0` (decision model failing → LLM fallback) to real answers (`restates=1/2`, 7k–29k tokens per run), and an 84-memory consolidation queue drained cleanly.
 
 ## Gotchas
