@@ -59,24 +59,32 @@ bc = model.lm_head.bias if model.lm_head.bias is not None else None
 
 _base = model.model
 
+# The classifier columns are a tiny subset (~528) of the ~248k-vocabulary lm_head.
+# Projecting the full [L, V] head and then slicing it forces the XPU to hold a
+# 248k-wide transient, which is what OOM-ed the shared-memory Arc 140V. Slice the
+# weight down to only the classifier rows up front and project directly: for
+# Qwen3.5 the final RMSNorm is applied inside `model.model.forward` (before
+# last_hidden_state), so `h @ W_narrow^T` is bit-identical to slicing the full
+# projection (verified: max abs diff 0.0), at ~1/470th the memory.
+_narrow_weight = model.lm_head.weight.detach()[cls_ids, :]  # [ncls, hidden]
+
 
 def forward_narrow(input_ids: torch.Tensor) -> torch.Tensor:
     """Return logits [batch, L, ncls] at the classifier tokens only.
 
-    Use model.lm_head on the whole pooled hidden state: for Qwen3.5 the final
-    RMSNorm lives *inside* lm_head (not in model.model.norm), so it cannot be
-    pre-applied to a column-sliced head. The cost is the full [L, V] projection,
-    which is acceptable at CPU batch size 1 (~248k vocab).
+    Uses a pre-sliced lm_head (only the classifier columns) so the XPU never
+    materializes the full-vocab projection. Bias is None for this model, but is
+    applied if present (sliced to the same columns).
     """
     with torch.no_grad():
         # BF16 on XPU is the fast path, but some fetches of intermediate tensors on
-        # the device allocate transient GPU memory. Keep the LM-head projection in the
-        # model's own dtype and materialize it as float only at the final narrow slice.
-        h = _base(input_ids=input_ids, use_cache=False).last_hidden_state
-        logits = model.lm_head(h)  # dtype = weight dtype (bf16 on XPU)
+        # the device allocate transient GPU memory. Keep the projection in BF16 and
+        # materialize it as float only at the final (already-narrow) result.
+        h = _base(input_ids=input_ids, use_cache=False).last_hidden_state  # [B, L, D]
+        logits = h.to(_narrow_weight.dtype) @ _narrow_weight.t()  # [B, L, ncls]
         if bc is not None:
-            logits = logits + bc
-        return logits[:, :, cls_ids].float()  # [batch, L, ncls], float
+            logits = logits + bc[cls_ids]
+        return logits.float()
 
 
 def _to_device(t: torch.Tensor) -> torch.Tensor:
@@ -140,6 +148,9 @@ _infer_lock = asyncio.Lock()
 # so the first real decision after idle has to page the weights back into device memory
 # and can hit OUT_OF_DEVICE_MEMORY (code 39). A periodic no-op forward pass holds the
 # context resident. Only active on XPU; a no-op on CPU. Disabled by HS_DECIDE_WARM_SECONDS=0.
+# NOTE: the narrowed lm_head (above) removes the per-pass OOM trigger, so on an
+# OOM-prone shared-memory iGPU it is often better to disable keep-warm (set 0) rather
+# than have the warm pass itself collide with real requests.
 _WARM_INTERVAL = float(os.environ.get("HS_DECIDE_WARM_SECONDS", "60"))
 
 # One persistent probe tensor, allocated once. Building a fresh tensor each tick

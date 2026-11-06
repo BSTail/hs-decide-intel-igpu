@@ -4,12 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/CHANGE_ME/hs-decide
-Environment=HS_DECIDE_MODEL_DIR=/home/CHANGE_ME/hs-decide/model
+WorkingDirectory=__HS_DECIDE_HOME__/hs-decide
+Environment=HS_DECIDE_MODEL_DIR=__HS_DECIDE_HOME__/hs-decide/model
 Environment=HS_DECIDE_FP32=0
 Environment=HS_DECIDE_DEVICE=xpu
 Environment=HS_DECIDE_API_KEY=<your-secret>
-ExecStart=/home/CHANGE_ME/hs-decide/xpu-venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+Environment=HS_DECIDE_WARM_SECONDS=0
+ExecStart=__HS_DECIDE_HOME__/hs-decide/xpu-venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=3
 
